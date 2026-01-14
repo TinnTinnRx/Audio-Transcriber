@@ -1,0 +1,424 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>แอพถอดเสียงบนเบราว์เซอร์ (Browser-based Transcriber)</title>
+    
+    <!-- React & ReactDOM -->
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- PDF Generation -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+
+    <!-- Icons -->
+    <script src="https://unpkg.com/lucide@latest"></script>
+
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Sarabun:wght@300;400;600&display=swap');
+        body { font-family: 'Sarabun', sans-serif; }
+        .recording-pulse {
+            animation: pulse-red 2s infinite;
+        }
+        @keyframes pulse-red {
+            0% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.7); }
+            70% { box-shadow: 0 0 0 10px rgba(239, 68, 68, 0); }
+            100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0); }
+        }
+    </style>
+</head>
+<body class="bg-gray-50 text-gray-800">
+    <div id="root"></div>
+
+    <script type="module">
+        import { pipeline, env } from 'https://cdn.jsdelivr.net/npm/@xenova/transformers@2.16.0';
+        
+        // ตั้งค่าให้ไม่โหลด local model แต่ดึงจาก HuggingFace แทน
+        env.allowLocalModels = false;
+        env.useBrowserCache = true;
+
+        window.Pipeline = pipeline;
+    </script>
+
+    <script type="text/babel">
+        const { useState, useEffect, useRef } = React;
+
+        // --- Web Worker Setup for Non-blocking AI ---
+        const workerCode = `
+            import { pipeline, env } from 'https://cdn.jsdelivr.net/npm/@xenova/transformers@2.16.0';
+            env.allowLocalModels = false;
+
+            let transcriber = null;
+
+            self.onmessage = async (event) => {
+                const { type, audio, language, modelName } = event.data;
+
+                if (type === 'load') {
+                    try {
+                        self.postMessage({ status: 'loading', message: 'กำลังดาวน์โหลดโมเดล...' });
+                        transcriber = await pipeline('automatic-speech-recognition', modelName || 'Xenova/whisper-tiny');
+                        self.postMessage({ status: 'ready' });
+                    } catch (error) {
+                        self.postMessage({ status: 'error', message: error.message });
+                    }
+                } else if (type === 'transcribe') {
+                    if (!transcriber) {
+                        self.postMessage({ status: 'error', message: 'Model not loaded yet' });
+                        return;
+                    }
+                    try {
+                        self.postMessage({ status: 'processing', message: 'กำลังถอดเสียง...' });
+                        
+                        // Config for multilingual support
+                        const options = {
+                            chunk_length_s: 30,
+                            stride_length_s: 5,
+                            language: language === 'auto' ? null : language,
+                            task: 'transcribe',
+                        };
+
+                        const output = await transcriber(audio, options);
+                        self.postMessage({ status: 'complete', text: output.text });
+                    } catch (error) {
+                        self.postMessage({ status: 'error', message: error.message });
+                    }
+                }
+            };
+        `;
+
+        const workerBlob = new Blob([workerCode], { type: 'application/javascript' });
+        const workerUrl = URL.createObjectURL(workerBlob);
+
+        // --- Safe Icon Component ---
+        // แก้ไขปัญหา React Conflict โดยใช้ Wrapper ที่ React ควบคุมได้
+        const Icon = ({ name, className }) => {
+            const ref = useRef(null);
+            
+            useEffect(() => {
+                if (ref.current) {
+                    // สร้าง Element ชั่วคราวเพื่อให้ Lucide แปลง
+                    const i = document.createElement('i');
+                    i.setAttribute('data-lucide', name);
+                    if (className) i.className = className;
+                    
+                    // ล้างของเก่าและใส่ของใหม่
+                    ref.current.replaceChildren(i);
+                    
+                    // สั่งให้ Lucide แปลง <i> เป็น <svg> เฉพาะใน ref นี้
+                    lucide.createIcons({
+                        root: ref.current,
+                        nameAttr: 'data-lucide'
+                    });
+                }
+            }, [name, className]);
+
+            return <span ref={ref} className="inline-flex items-center justify-center" />;
+        };
+
+        function App() {
+            const [worker, setWorker] = useState(null);
+            const [status, setStatus] = useState('idle'); // idle, loading, ready, processing, error
+            const [statusMessage, setStatusMessage] = useState('');
+            const [text, setText] = useState('');
+            const [activeTab, setActiveTab] = useState('upload'); // upload, record
+            const [isRecording, setIsRecording] = useState(false);
+            const [audioUrl, setAudioUrl] = useState(null);
+            const [language, setLanguage] = useState('th'); // Default Thai
+            
+            const mediaRecorderRef = useRef(null);
+            const audioChunksRef = useRef([]);
+
+            useEffect(() => {
+                const w = new Worker(workerUrl, { type: 'module' });
+                w.onmessage = (e) => {
+                    const { status, message, text } = e.data;
+                    if (status === 'loading') {
+                        setStatus('loading');
+                        setStatusMessage(message);
+                    } else if (status === 'ready') {
+                        setStatus('ready');
+                        setStatusMessage('โมเดลพร้อมใช้งาน');
+                    } else if (status === 'processing') {
+                        setStatus('processing');
+                        setStatusMessage(message);
+                    } else if (status === 'complete') {
+                        setStatus('ready');
+                        setText(text);
+                        setStatusMessage('เสร็จสิ้น');
+                    } else if (status === 'error') {
+                        setStatus('error');
+                        setStatusMessage('เกิดข้อผิดพลาด: ' + message);
+                    }
+                };
+                
+                // Initialize model immediately
+                w.postMessage({ type: 'load', modelName: 'Xenova/whisper-tiny' });
+                setWorker(w);
+
+                return () => w.terminate();
+            }, []);
+
+            // ลบ useEffect ที่เรียก createIcons() แบบ global ออก เพื่อป้องกัน conflict
+
+            // --- Audio Processing ---
+            const readAudioFile = async (file) => {
+                const audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+                const arrayBuffer = await file.arrayBuffer();
+                const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+                return audioBuffer.getChannelData(0); // Get raw audio data
+            };
+
+            const handleFileUpload = async (e) => {
+                const file = e.target.files[0];
+                if (!file) return;
+
+                setAudioUrl(URL.createObjectURL(file));
+                processAudio(file);
+            };
+
+            const processAudio = async (input) => {
+                if (!worker) return;
+                
+                try {
+                    let audioData;
+                    if (input instanceof File || input instanceof Blob) {
+                        audioData = await readAudioFile(input);
+                    } else {
+                        audioData = input; // Assuming float32 array
+                    }
+                    
+                    worker.postMessage({ 
+                        type: 'transcribe', 
+                        audio: audioData, 
+                        language: language 
+                    });
+                } catch (err) {
+                    setStatus('error');
+                    setStatusMessage('ไม่สามารถอ่านไฟล์เสียงได้');
+                    console.error(err);
+                }
+            };
+
+            // --- Recording ---
+            const startRecording = async () => {
+                try {
+                    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                    const mediaRecorder = new MediaRecorder(stream);
+                    mediaRecorderRef.current = mediaRecorder;
+                    audioChunksRef.current = [];
+
+                    mediaRecorder.ondataavailable = (event) => {
+                        if (event.data.size > 0) {
+                            audioChunksRef.current.push(event.data);
+                        }
+                    };
+
+                    mediaRecorder.onstop = () => {
+                        const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/wav' });
+                        const url = URL.createObjectURL(audioBlob);
+                        setAudioUrl(url);
+                        processAudio(audioBlob);
+                        
+                        // Stop all tracks
+                        stream.getTracks().forEach(track => track.stop());
+                    };
+
+                    mediaRecorder.start();
+                    setIsRecording(true);
+                } catch (err) {
+                    console.error(err);
+                    alert("ไม่สามารถเข้าถึงไมโครโฟนได้");
+                }
+            };
+
+            const stopRecording = () => {
+                if (mediaRecorderRef.current && isRecording) {
+                    mediaRecorderRef.current.stop();
+                    setIsRecording(false);
+                }
+            };
+
+            // --- Export PDF ---
+            const downloadPDF = () => {
+                const { jsPDF } = window.jspdf;
+                // Using Print to PDF logic for better Thai support
+                const printWindow = window.open('', '', 'height=600,width=800');
+                printWindow.document.write('<html><head><title>Transcription Result</title>');
+                printWindow.document.write('<style>body { font-family: "Sarabun", sans-serif; padding: 20px; }</style>');
+                printWindow.document.write('</head><body>');
+                printWindow.document.write('<h1>ผลการถอดเสียง</h1>');
+                printWindow.document.write('<hr/>');
+                printWindow.document.write(`<p>${text}</p>`);
+                printWindow.document.write('</body></html>');
+                printWindow.document.close();
+                printWindow.print();
+            };
+
+            return (
+                <div className="min-h-screen flex flex-col items-center py-10 px-4">
+                    <div className="w-full max-w-3xl bg-white rounded-xl shadow-xl overflow-hidden border border-gray-100">
+                        
+                        {/* Header */}
+                        <div className="bg-indigo-600 p-6 text-white text-center">
+                            <h1 className="text-2xl font-bold mb-2">Web Audio Transcriber</h1>
+                            <p className="text-indigo-100 text-sm">ถอดเสียงผ่านเบราว์เซอร์ด้วย AI (Whisper Model)</p>
+                            <p className="text-xs text-indigo-200 mt-1">ทำงานแบบ Offline 100% หลังโหลดโมเดลเสร็จ</p>
+                        </div>
+
+                        <div className="p-6">
+                            
+                            {/* Controls */}
+                            <div className="flex flex-wrap gap-4 mb-6 justify-center">
+                                <button 
+                                    onClick={() => setActiveTab('upload')}
+                                    className={`flex items-center gap-2 px-4 py-2 rounded-lg transition ${activeTab === 'upload' ? 'bg-indigo-100 text-indigo-700 border border-indigo-200' : 'text-gray-500 hover:bg-gray-50'}`}
+                                >
+                                    <Icon name="upload" className="w-4 h-4" /> อัปโหลดไฟล์
+                                </button>
+                                <button 
+                                    onClick={() => setActiveTab('record')}
+                                    className={`flex items-center gap-2 px-4 py-2 rounded-lg transition ${activeTab === 'record' ? 'bg-indigo-100 text-indigo-700 border border-indigo-200' : 'text-gray-500 hover:bg-gray-50'}`}
+                                >
+                                    <Icon name="mic" className="w-4 h-4" /> อัดเสียง
+                                </button>
+                            </div>
+
+                            {/* Input Area */}
+                            <div className="mb-6 p-8 border-2 border-dashed border-gray-200 rounded-xl flex flex-col items-center justify-center bg-gray-50 min-h-[200px]">
+                                {activeTab === 'upload' ? (
+                                    <div className="text-center w-full">
+                                        <div className="flex justify-center mb-4">
+                                            <Icon name="file-audio" className="w-12 h-12 text-gray-400" />
+                                        </div>
+                                        <label className="block mb-2 text-sm font-medium text-gray-900">เลือกไฟล์เสียงหรือวิดีโอ</label>
+                                        <input 
+                                            type="file" 
+                                            accept="audio/*,video/*"
+                                            onChange={handleFileUpload}
+                                            className="block w-full text-sm text-gray-500
+                                            file:mr-4 file:py-2 file:px-4
+                                            file:rounded-full file:border-0
+                                            file:text-sm file:font-semibold
+                                            file:bg-indigo-50 file:text-indigo-700
+                                            hover:file:bg-indigo-100 cursor-pointer mx-auto max-w-xs"
+                                        />
+                                        <p className="mt-2 text-xs text-gray-500">รองรับ .mp3, .wav, .mp4, .m4a</p>
+                                    </div>
+                                ) : (
+                                    <div className="text-center">
+                                        {!isRecording ? (
+                                            <button 
+                                                onClick={startRecording}
+                                                className="w-20 h-20 rounded-full bg-red-500 hover:bg-red-600 text-white flex items-center justify-center shadow-lg transition transform hover:scale-105"
+                                            >
+                                                <Icon name="mic" className="w-8 h-8" />
+                                            </button>
+                                        ) : (
+                                            <button 
+                                                onClick={stopRecording}
+                                                className="w-20 h-20 rounded-full bg-white border-4 border-red-500 text-red-500 flex items-center justify-center shadow-lg recording-pulse"
+                                            >
+                                                <div className="text-red-500 fill-current">
+                                                     <Icon name="square" className="w-8 h-8" />
+                                                </div>
+                                            </button>
+                                        )}
+                                        <p className="mt-4 font-medium text-gray-700">
+                                            {isRecording ? "กำลังบันทึก... (กดเพื่อหยุด)" : "กดปุ่มเพื่อเริ่มบันทึก"}
+                                        </p>
+                                    </div>
+                                )}
+                            </div>
+
+                            {/* Options */}
+                            <div className="flex flex-wrap items-center gap-4 mb-6 p-4 bg-gray-50 rounded-lg">
+                                <div className="flex items-center gap-2">
+                                    <Icon name="settings" className="w-4 h-4 text-gray-500" />
+                                    <span className="text-sm font-medium">ภาษา:</span>
+                                </div>
+                                <select 
+                                    value={language} 
+                                    onChange={(e) => setLanguage(e.target.value)}
+                                    className="bg-white border border-gray-300 text-gray-900 text-sm rounded-lg focus:ring-indigo-500 focus:border-indigo-500 block p-2"
+                                >
+                                    <option value="th">ภาษาไทย (Thai)</option>
+                                    <option value="en">ภาษาอังกฤษ (English)</option>
+                                    <option value="ja">ภาษาญี่ปุ่น (Japanese)</option>
+                                    <option value="zh">ภาษาจีน (Chinese)</option>
+                                    <option value="auto">ตรวจจับอัตโนมัติ (Auto)</option>
+                                </select>
+                            </div>
+
+                            {/* Status Bar */}
+                            {status !== 'idle' && (
+                                <div className={`mb-6 p-4 rounded-lg flex items-center gap-3 ${
+                                    status === 'error' ? 'bg-red-50 text-red-700' : 
+                                    status === 'ready' ? 'bg-green-50 text-green-700' : 
+                                    'bg-blue-50 text-blue-700'
+                                }`}>
+                                    {(status === 'loading' || status === 'processing') && (
+                                        <div className="animate-spin">
+                                            <Icon name="loader-2" className="w-5 h-5" />
+                                        </div>
+                                    )}
+                                    <span className="text-sm font-medium">{statusMessage}</span>
+                                </div>
+                            )}
+
+                            {/* Audio Preview */}
+                            {audioUrl && (
+                                <div className="mb-6">
+                                    <audio controls src={audioUrl} className="w-full rounded-lg"></audio>
+                                </div>
+                            )}
+
+                            {/* Result Area */}
+                            <div className="relative">
+                                <label className="block mb-2 text-sm font-medium text-gray-900">ผลลัพธ์ข้อความ:</label>
+                                <textarea 
+                                    value={text}
+                                    onChange={(e) => setText(e.target.value)}
+                                    className="block p-4 w-full h-64 text-sm text-gray-900 bg-gray-50 rounded-lg border border-gray-300 focus:ring-indigo-500 focus:border-indigo-500"
+                                    placeholder="ข้อความที่ถอดเสียงจะปรากฏที่นี่..."
+                                ></textarea>
+                                
+                                <div className="absolute bottom-4 right-4 flex gap-2">
+                                    <button 
+                                        onClick={() => {navigator.clipboard.writeText(text); alert('คัดลอกแล้ว!');}}
+                                        disabled={!text}
+                                        className="p-2 bg-white rounded-md shadow hover:bg-gray-100 text-gray-600 disabled:opacity-50"
+                                        title="Copy Text"
+                                    >
+                                        <Icon name="file-text" className="w-4 h-4" />
+                                    </button>
+                                </div>
+                            </div>
+
+                            {/* Action Buttons */}
+                            <div className="mt-6 flex justify-end">
+                                <button 
+                                    onClick={downloadPDF}
+                                    disabled={!text}
+                                    className="flex items-center gap-2 bg-indigo-600 hover:bg-indigo-700 text-white font-medium py-2 px-6 rounded-lg shadow disabled:opacity-50 disabled:cursor-not-allowed transition"
+                                >
+                                    <Icon name="download" className="w-4 h-4" /> ดาวน์โหลด PDF
+                                </button>
+                            </div>
+
+                        </div>
+                    </div>
+                    <p className="mt-4 text-xs text-gray-400">Powered by Transformers.js & OpenAI Whisper (In-Browser)</p>
+                </div>
+            );
+        }
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
